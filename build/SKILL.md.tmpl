@@ -1,0 +1,277 @@
+---
+name: build
+version: 1.0.0
+description: |
+  Orchestrator that executes a plan built by /team. Reads workflow.yaml,
+  invokes agents in dependency order, manages checkpoints and revision loops,
+  and tracks progress via document frontmatter. Use when asked to "build",
+  "execute the plan", "run the team", or "/build".
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+# Build Orchestrator
+
+You are running the `/build` workflow. Read the plan created by `/team`,
+invoke agents in order, manage checkpoints, and track progress.
+
+**Key constraint:** You (the main session) are always the orchestrator. Invoke
+agents via the Agent tool. All coordination flows through `.plan/` documents.
+
+---
+
+## Step 1: Validate Plan
+
+Check that the plan exists and is valid:
+
+```bash
+cat .plan/workflow.yaml 2>/dev/null || echo "NO_WORKFLOW"
+cat .plan/PLAN.md 2>/dev/null || echo "NO_PLAN"
+ls .claude/agents/ 2>/dev/null || echo "NO_AGENTS"
+```
+
+**If NO_WORKFLOW or NO_PLAN:** Tell the user: "No plan found. Run `/team <task>` first to build a team and plan." Then stop.
+
+**If NO_AGENTS:** Tell the user: "Plan exists but no agents found in `.claude/agents/`. Run `/team` to regenerate." Then stop.
+
+Parse `workflow.yaml` to get: task, team, phases (with dependencies, checkpoints), parallel groups, and rejection protocol.
+
+---
+
+## Step 2: Read State
+
+Parse frontmatter from every `.plan/*.md` document to build a status map.
+
+```bash
+for f in .plan/*.md; do
+  echo "=== $(basename "$f") ==="
+  head -20 "$f"
+  echo "---"
+done
+```
+
+Build the status map:
+
+```
+requirements.md    → complete
+architecture.md    → complete
+backend-impl.md    → pending     ← RESUME HERE
+test-plan.md       → pending
+```
+
+**Status rules:**
+- `complete` → skip this phase
+- `in-progress` → check if it has a Summary section; if yes, mark `complete` and move on; if no, re-invoke the agent
+- `revision-needed` → re-invoke with revision feedback (check revision count)
+- `pending` → this is the next phase to execute (if dependencies are met)
+- `blocked` → skip and report to user
+
+**Resume point:** The first phase whose document is not `complete` AND whose dependencies are all `complete`.
+
+Output the status map to the user:
+
+```
+BUILD STATUS
+══════════════════════════════════════
+Task: <task from workflow.yaml>
+
+  ✓ requirements.md     — complete
+  ✓ architecture.md     — complete
+  ○ backend-impl.md     — pending ← NEXT
+  ○ test-plan.md        — pending
+══════════════════════════════════════
+```
+
+---
+
+## Step 3: Execute Phases
+
+For each phase in execution order (respecting dependencies):
+
+### 3a. Check Dependencies
+
+A phase is **ready** when ALL documents listed in its `depends_on` have `status: complete`.
+
+If a phase's dependencies are not met, skip it (it will be picked up in a later pass or when a parallel group completes).
+
+### 3b. Update Document Status
+
+Before invoking the agent, update the document frontmatter:
+
+Read the document, then edit the frontmatter to set:
+- `status: in-progress`
+- `updated: <current ISO8601 timestamp>`
+
+### 3c. Invoke the Agent
+
+Read the agent definition to understand what it should do:
+
+```bash
+cat .claude/agents/<agent-id>.md
+```
+
+Invoke the agent using the Agent tool with `subagent_type: "general-purpose"` and `model: "opus"`. Give it a clear prompt:
+
+```
+You are the <Role Name>. Execute your assignment.
+
+Your assignment is defined in: .claude/agents/<agent-id>.md
+Read it first, then follow the instructions exactly.
+
+Your output document is: .plan/<document-name>
+Your upstream documents to read first: <list from depends_on>
+
+When done, update your document's frontmatter status to "complete" and add a
+Summary section at the top (after frontmatter).
+```
+
+### 3d. Verify Completion
+
+After the agent returns, verify its work:
+
+1. Read the document and check frontmatter `status`
+2. Check for a `## Summary` section
+3. If both present → mark phase complete in your tracking
+4. If missing → set `status: in-progress` and note the issue
+
+### 3e. Checkpoint (if configured)
+
+If this phase has `checkpoint: true` in the workflow, present the output to the user:
+
+Read the document's Summary section and present via AskUserQuestion:
+
+```
+Phase complete: <Phase Name>
+Agent: <role-id>
+Document: .plan/<document-name>
+
+SUMMARY:
+<paste the Summary section content>
+
+RECOMMENDATION: Choose A to proceed. <one-line rationale>
+
+A) Approve — proceed to next phase
+B) Revise — send back with feedback (tell me what to change)
+C) Skip — move on without this phase's output
+D) Abort — stop the build
+```
+
+**If the user chooses B (Revise):**
+1. Get the user's feedback
+2. Update document frontmatter: `status: revision-needed`, increment `revision` counter
+3. Re-invoke the agent with the feedback appended to the prompt:
+
+```
+REVISION REQUESTED (revision <N>):
+<user's feedback>
+
+Read your document at .plan/<document-name> and revise it based on the feedback above.
+Update the Summary section with what changed.
+Set status to "complete" when done.
+```
+
+4. After revision, re-checkpoint (present to user again)
+5. If revision count reaches `max_revisions` from the workflow (default 3), escalate:
+
+```
+This document has been revised <N> times. The agent may not be able to address
+the feedback effectively.
+
+A) Try one more revision with additional guidance
+B) Accept as-is and move on
+C) Abort the build
+```
+
+**If the user chooses C (Skip):** Mark document `status: complete` with a note that it was skipped, continue.
+
+**If the user chooses D (Abort):** Stop execution. State what was completed and what remains.
+
+### 3f. Parallel Execution
+
+If `parallel_groups` in the workflow lists phases that can run concurrently:
+
+1. Check that ALL dependencies for ALL phases in the group are met
+2. If yes, invoke all agents in the group simultaneously using multiple Agent tool calls in a single message
+3. Wait for all to complete
+4. Checkpoint each one that requires it (sequentially, so the user reviews one at a time)
+
+---
+
+## Step 4: Update PLAN.md Progress
+
+After each phase completes (or is skipped), update PLAN.md:
+
+Change `- [ ] Phase N: <name>` to `- [x] Phase N: <name>` for completed phases.
+
+Also update the PLAN.md frontmatter `status`:
+- `in-progress` while phases remain
+- `complete` when all phases are done
+
+---
+
+## Step 5: Final Summary
+
+When all phases are complete:
+
+```bash
+git diff --stat 2>/dev/null || true
+```
+
+Output:
+
+```
+BUILD COMPLETE
+══════════════════════════════════════
+Task:     <task>
+Phases:   <completed>/<total> complete
+Revisions: <total revision count across all phases>
+
+Documents:
+  ✓ <document-name> — <one-line summary from each>
+  ...
+
+Files changed:
+  <git diff --stat output>
+
+Next steps:
+  - /review — pre-landing code review
+  - /qa — test the implementation
+  - /ship — create PR and ship
+══════════════════════════════════════
+```
+
+---
+
+## Resume Logic
+
+All state is in `.plan/` document frontmatter. If a session is interrupted:
+
+1. `/build` re-reads all frontmatter (Step 2)
+2. Skips phases with `status: complete`
+3. For `status: in-progress` with a Summary section → marks complete, moves on
+4. For `status: in-progress` without Summary → re-invokes the agent
+5. For `status: revision-needed` → re-invokes with previous revision feedback
+6. Resumes from the first incomplete phase
+
+This means `/build` is fully idempotent — safe to run multiple times.
+
+---
+
+## Important Rules
+
+- **You are the orchestrator, not an implementer.** Never write code yourself. Always delegate to agents.
+- **One agent per phase.** Each phase invokes exactly one agent that owns one document.
+- **Documents are truth.** Frontmatter status is the single source of truth for progress.
+- **Checkpoints are mandatory.** If the workflow says checkpoint, you must present to the user. Do not skip.
+- **Revisions are bounded.** Default max 3. Escalate after that.
+- **Parallel when possible.** Use parallel agent invocation for independent phases.
+- **Resume is automatic.** Just run `/build` again — it picks up where it left off.
+- **Abort is clean.** If the user aborts, all completed work remains in `.plan/` documents.
